@@ -69,6 +69,59 @@ public actor ContactsService {
 
     private init() {}
 
+    /// After `terminate()` (SIGTERM), how long osascript gets to exit before SIGKILL.
+    private static let terminateGrace: TimeInterval = 2
+
+    /// How long the pipes may stay open once the process is gone. They normally close
+    /// with it; only a child that inherited a write end keeps them open.
+    private static let pipeDrainGrace: TimeInterval = 5
+
+    /// AppleScript handlers shared by every script that formats an address.
+    ///
+    /// Contacts returns `missing value` for an empty address field, and both `txt` and
+    /// plain `&` concatenation turn that into the literal text "missing value". Measured
+    /// on a 1933-contact book: 180 of 195 addresses carried it, mostly in `state`, which
+    /// is empty for most non-US addresses. `formatAddress` drops empty parts instead,
+    /// keeping the "street, city, state zip, country" order, and flattens line breaks
+    /// and tabs (a multi-line street would otherwise split the tab-separated record).
+    private static let addressHandlers = """
+    on addrTxt(v)
+        if v is missing value then return ""
+        try
+            set s to v as string
+        on error
+            return ""
+        end try
+        set AppleScript's text item delimiters to {return, linefeed, tab}
+        set parts to text items of s
+        set AppleScript's text item delimiters to " "
+        set s to parts as string
+        set AppleScript's text item delimiters to ""
+        return s
+    end addrTxt
+
+    -- Parameter names avoid `st`/`nd`/`rd`/`th`: AppleScript parses those as ordinal
+    -- suffixes and rejects the whole script with a syntax error (-2741).
+    on formatAddress(aStreet, aCity, aState, aZip, aCountry)
+        set region to my addrTxt(aState)
+        set z to my addrTxt(aZip)
+        if region is "" then
+            set region to z
+        else if z is not "" then
+            set region to region & " " & z
+        end if
+        set out to ""
+        repeat with s in {my addrTxt(aStreet), my addrTxt(aCity), region, my addrTxt(aCountry)}
+            set s to contents of s
+            if s is not "" then
+                if out is not "" then set out to out & ", "
+                set out to out & s
+            end if
+        end repeat
+        return out
+    end formatAddress
+    """
+
     // MARK: - AppleScript Execution
 
     private func runAppleScript(_ script: String, timeout: TimeInterval = 120) async throws -> String {
@@ -120,6 +173,17 @@ public actor ContactsService {
                 let timeoutWork = DispatchWorkItem {
                     guard process.isRunning else { return }
                     process.terminate()
+                    // SIGTERM can be ignored, and then nothing closes the pipes. Give it
+                    // a short grace, then SIGKILL. Checking isRunning first means the pid
+                    // has not been reaped yet, so it cannot have been reused. This blocks
+                    // one ioQueue thread for at most the grace, and only on a timeout.
+                    let deadline = Date().addingTimeInterval(Self.terminateGrace)
+                    while process.isRunning, Date() < deadline {
+                        usleep(50_000)
+                    }
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
                     // Surface the timeout instead of returning "" — an empty string parses
                     // as "no contacts", indistinguishable from a genuinely empty result,
                     // which hides the real failure from callers (and from MCP clients).
@@ -180,18 +244,42 @@ public actor ContactsService {
         sink: PipeSink,
         failure: Error?
     ) async throws -> String {
-        // Both reads end when osascript closes its descriptors, on exit or on terminate().
-        // Awaiting the group rather than calling wait() keeps this off the actor's thread,
-        // and guarantees no read is still in flight when the handles are closed below.
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            ioGroup.notify(queue: ioQueue) { continuation.resume() }
+        // Both reads end when every write end closes, which normally happens when
+        // osascript exits. Awaiting the group rather than calling wait() keeps this off
+        // the actor's thread, and guarantees no read is still in flight when the handles
+        // are closed below.
+        //
+        // The wait is bounded: a child that inherited a write end (e.g. something
+        // backgrounded from `do shell script`) keeps the pipes open after osascript is
+        // gone, and an unbounded wait would then hang the call for as long as that child
+        // lives — the timeout above cannot help, because the process has already exited.
+        let drained = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let resumeOnce = ResumeOnce()
+            ioGroup.notify(queue: ioQueue) {
+                resumeOnce.once { continuation.resume(returning: true) }
+            }
+            ioQueue.asyncAfter(deadline: .now() + Self.pipeDrainGrace) {
+                resumeOnce.once { continuation.resume(returning: false) }
+            }
         }
 
-        outputPipe.fileHandleForReading.closeFile()
-        errorPipe.fileHandleForReading.closeFile()
+        // Close only when no read is in flight. Closing under a blocked read would raise
+        // an Objective-C exception; leaving the descriptors to the stuck readers instead
+        // leaks two fds until the child exits, which is the lesser cost.
+        if drained {
+            outputPipe.fileHandleForReading.closeFile()
+            errorPipe.fileHandleForReading.closeFile()
+        }
 
         if let failure {
             throw failure
+        }
+
+        guard drained else {
+            throw ContactsError.operationFailed(
+                "osascript exited but its output pipes stayed open for \(Int(Self.pipeDrainGrace))s "
+                    + "(a child process may still hold them)"
+            )
         }
 
         let outData = sink.standardOutput
@@ -236,6 +324,8 @@ public actor ContactsService {
         // Contacts resolves a range element-by-element, so asking for less costs ~90x
         // more. The whole-collection specifier is the only fast path.
         let script = """
+        \(Self.addressHandlers)
+
         on txt(v)
             if v is missing value then return "missing value"
             try
@@ -298,11 +388,11 @@ public actor ContactsService {
             set streets to item i of stAll
             if streets is not missing value then
                 repeat with j from 1 to (count of streets)
-                    set part to my txt(item j of streets)
-                    if part is "missing value" then set part to ""
-                    set part to part & ", " & my txt(item j of (item i of ctAll)) & ", " & my txt(item j of (item i of staAll)) & " " & my txt(item j of (item i of zipAll)) & ", " & my txt(item j of (item i of cnAll))
-                    if addrOut is not "" then set addrOut to addrOut & ";;;"
-                    set addrOut to addrOut & part
+                    set part to my formatAddress(item j of streets, item j of (item i of ctAll), item j of (item i of staAll), item j of (item i of zipAll), item j of (item i of cnAll))
+                    if part is not "" then
+                        if addrOut is not "" then set addrOut to addrOut & ";;;"
+                        set addrOut to addrOut & part
+                    end if
                 end repeat
             end if
 
@@ -323,6 +413,8 @@ public actor ContactsService {
         let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"")
 
         let script = """
+        \(Self.addressHandlers)
+
         tell application "Contacts"
             set output to ""
             set matchedPeople to (every person whose name contains "\(escapedQuery)")
@@ -352,12 +444,14 @@ public actor ContactsService {
 
                 set addrList to ""
                 repeat with a in addresses of p
-                    if addrList is not "" then set addrList to addrList & ";;;"
                     set addrParts to ""
                     try
-                        set addrParts to (street of a) & ", " & (city of a) & ", " & (state of a) & " " & (zip of a) & ", " & (country of a)
+                        set addrParts to my formatAddress(street of a, city of a, state of a, zip of a, country of a)
                     end try
-                    set addrList to addrList & addrParts
+                    if addrParts is not "" then
+                        if addrList is not "" then set addrList to addrList & ";;;"
+                        set addrList to addrList & addrParts
+                    end if
                 end repeat
 
                 set recordLine to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
@@ -378,6 +472,8 @@ public actor ContactsService {
         let escapedId = id.replacingOccurrences(of: "\"", with: "\\\"")
 
         let script = """
+        \(Self.addressHandlers)
+
         tell application "Contacts"
             try
                 set p to first person whose id is "\(escapedId)"
@@ -406,12 +502,14 @@ public actor ContactsService {
 
                 set addrList to ""
                 repeat with a in addresses of p
-                    if addrList is not "" then set addrList to addrList & ";;;"
                     set addrParts to ""
                     try
-                        set addrParts to (street of a) & ", " & (city of a) & ", " & (state of a) & " " & (zip of a) & ", " & (country of a)
+                        set addrParts to my formatAddress(street of a, city of a, state of a, zip of a, country of a)
                     end try
-                    set addrList to addrList & addrParts
+                    if addrParts is not "" then
+                        if addrList is not "" then set addrList to addrList & ";;;"
+                        set addrList to addrList & addrParts
+                    end if
                 end repeat
 
                 return contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
@@ -571,6 +669,8 @@ public actor ContactsService {
         let escapedName = groupName.replacingOccurrences(of: "\"", with: "\\\"")
 
         let script = """
+        \(Self.addressHandlers)
+
         tell application "Contacts"
             set output to ""
             try
@@ -601,12 +701,14 @@ public actor ContactsService {
 
                     set addrList to ""
                     repeat with a in addresses of p
-                        if addrList is not "" then set addrList to addrList & ";;;"
                         set addrParts to ""
                         try
-                            set addrParts to (street of a) & ", " & (city of a) & ", " & (state of a) & " " & (zip of a) & ", " & (country of a)
+                            set addrParts to my formatAddress(street of a, city of a, state of a, zip of a, country of a)
                         end try
-                        set addrList to addrList & addrParts
+                        if addrParts is not "" then
+                            if addrList is not "" then set addrList to addrList & ";;;"
+                            set addrList to addrList & addrParts
+                        end if
                     end repeat
 
                     set recordLine to contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
@@ -635,6 +737,8 @@ public actor ContactsService {
         // Optimized AppleScript: returns immediately on first match
         // Uses longer timeout for large contact databases
         let script = """
+        \(Self.addressHandlers)
+
         with timeout of 300 seconds
             tell application "Contacts"
                 repeat with p in people
@@ -665,12 +769,14 @@ public actor ContactsService {
 
                             set addrList to ""
                             repeat with a in addresses of p
-                                if addrList is not "" then set addrList to addrList & ";;;"
                                 set addrParts to ""
                                 try
-                                    set addrParts to (street of a) & ", " & (city of a) & ", " & (state of a) & " " & (zip of a) & ", " & (country of a)
+                                    set addrParts to my formatAddress(street of a, city of a, state of a, zip of a, country of a)
                                 end try
-                                set addrList to addrList & addrParts
+                                if addrParts is not "" then
+                                    if addrList is not "" then set addrList to addrList & ";;;"
+                                    set addrList to addrList & addrParts
+                                end if
                             end repeat
 
                             return contactId & "\t" & firstName & "\t" & lastName & "\t" & orgName & "\t" & jobTitleVal & "\t" & noteVal & "\t" & birthdayVal & "\t" & emailList & "\t" & phoneList & "\t" & addrList
